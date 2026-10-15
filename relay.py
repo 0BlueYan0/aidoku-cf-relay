@@ -2,7 +2,8 @@
 
 Forwards requests to sites behind a Cloudflare challenge, carrying a clearance that TRAWL
 (https://github.com/germondai/trawl) earned once. The phone never meets the challenge, and
-TRAWL opens a browser only when there is no clearance yet or the site refuses it.
+TRAWL opens a browser only when there is no clearance yet, the site refuses it, or a host the
+reader uses is about to reach the age at which its site refused one before.
 
     GET POST HEAD PUT PATCH DELETE OPTIONS /r/<host>/<path>?<query>  ->  https://<host>/<path>?<query>
 
@@ -21,6 +22,7 @@ import hmac
 import http.server
 import ipaddress
 import json
+import math
 import os
 import re
 import socket
@@ -274,6 +276,7 @@ class Clearances:
         self.trawl_url = trawl_url.rstrip("/")
         self.trawl_ready = trawl_ready or self._trawl_ready
         self.keys = {}
+        self.obtained_at = {}
         self.locks = {}
         self.failed_at = {}
         self.guard = threading.Lock()
@@ -314,6 +317,7 @@ class Clearances:
                     self.failed(site)
                 raise
             self.failed_at.pop(site, None)
+            self.obtained_at[site] = self.clock()
             if self.keys[site][0]:
                 log(f"new clearance for {site} in {time.time() - started:.1f} s")
             if self.on_new and self.keys[site][0]:
@@ -325,11 +329,11 @@ class Clearances:
         mirror took 17 s before its home page showed, and it looked as if nothing reloaded.
 
         Waits for TRAWL first: a solve sent while it is still starting would fail. A site that
-        fails here is not paused; the reader's first request for it tries again. This only covers
-        the time after start-up: a clearance the site later stops accepting is renewed on demand.
+        fails here is not paused; the reader's first request for it tries again.
 
         A list is taken in its order (most recently solved first); a set alphabetically. `allows`
         filters hosts here, after TRAWL is up, so DNS lookups never delay the relay's start.
+        After start-up, `Upkeep` renews the hosts the reader keeps using.
         """
         ready = trawl_ready or self.trawl_ready
         deadline = self.clock() + wait
@@ -431,7 +435,192 @@ def send(method, url, headers, body):
         return error.code, error.headers, error.read()
 
 
-def make_handler(token, rules, clearances, sender=send):
+class Upkeep:
+    """Renews the clearances of hosts a reader used in the last `keep_days` before the site stops
+    taking them, so a reader in the middle of a chapter does not wait ~15 s for a solve.
+
+    The `cf_clearance` cookie says it lasts a year (TRAWL's answer for bakamh.com and baka1.cfd on
+    2026-10-15), but a site set to Cloudflare's default refuses it after 30 minutes. How long it
+    really lasts is therefore learned: each refusal notes the clearance's age, and from then on
+    the host is renewed at `RENEW_AT` of the shortest of the last `KEEP` ages, never sooner than
+    `RENEW_AT` of `MIN_LIFETIME`, so one early refusal (the IP's score dropping) does not open a
+    browser every few minutes.
+
+    Every `check_minutes` each host is also loaded once with its clearance (one page, no browser).
+    That finds a refusal before the reader meets it, including the first one of a host whose
+    lifetime is not known yet. An age found that way can be up to `check_minutes` too long; if
+    the reader is then refused before the renewal, that shorter age wins.
+
+    Renewing early means the site never refuses again, so the estimate could only shrink. Every
+    `TRIAL_EVERY`th early renewal is skipped instead and that clearance is left to the checks:
+    a check that passes at an age past the estimate drops the shorter ages, and a refusal notes
+    the real one. The reader may meet that refusal, one page in `TRIAL_EVERY` lifetimes.
+    """
+
+    KEEP = 3
+    TRIAL_EVERY = 5
+    MIN_LIFETIME = 600
+    RENEW_AT = 0.8
+    # The time a host was last used goes to the file at most this often, not on every page.
+    SAVE_EVERY = 3600
+
+    def __init__(self, path, clearances, keep_days, check_minutes, allows=None, sender=send, clock=time.time):
+        self.path = path
+        self.clearances = clearances
+        self.keep = keep_days * 86400
+        self.check = check_minutes * 60
+        self.allows = allows or (lambda host: True)
+        self.sender = sender
+        self.clock = clock
+        self.lock = threading.Lock()
+        self.lifetimes = {}
+        self.last_used = {}
+        self.saved_used = {}
+        self.checked_at = {}
+        self.next_try = {}
+        self.early = {}
+        self.trial = {}
+        self.noted = {}
+        self._load()
+
+    def _load(self):
+        """A missing or broken file starts from nothing: it only makes the first renewals later."""
+        try:
+            with open(self.path, encoding="utf-8") as file:
+                data = json.load(file)
+            lifetimes, used = data.get("lifetimes") or {}, data.get("last_used") or {}
+            for host, ages in lifetimes.items():
+                ages = [a for a in ages if isinstance(a, (int, float)) and 0 < a < float("inf")]
+                if HOST_NAME.fullmatch(host) and ages:
+                    self.lifetimes[host] = ages[-self.KEEP:]
+            for host, at in used.items():
+                if HOST_NAME.fullmatch(host) and isinstance(at, (int, float)) and math.isfinite(at):
+                    self.last_used[host] = at
+        except (OSError, ValueError, AttributeError, TypeError) as error:
+            if not isinstance(error, FileNotFoundError):
+                log(f"cannot read {self.path}, starting without it: {error}")
+        self.saved_used = dict(self.last_used)
+
+    def _save(self):
+        now = self.clock()
+        with self.lock:
+            self.last_used = {h: t for h, t in self.last_used.items() if now - t <= self.keep}
+            self.lifetimes = {h: a for h, a in self.lifetimes.items() if h in self.last_used}
+            self.saved_used = dict(self.last_used)
+            temporary = self.path + ".tmp"
+            try:
+                with open(temporary, "w", encoding="utf-8") as file:
+                    json.dump({"lifetimes": self.lifetimes, "last_used": self.last_used}, file)
+                os.replace(temporary, self.path)
+            except OSError as error:
+                log(f"cannot save {self.path}: {error}")
+
+    def lifetime(self, site):
+        """How long a clearance for `site` lasts, as far as is known, or None."""
+        ages = self.lifetimes.get(site)
+        return max(min(ages), self.MIN_LIFETIME) if ages else None
+
+    def used(self, site):
+        now = self.clock()
+        with self.lock:
+            self.last_used[site] = now
+            due = now - self.saved_used.get(site, now - self.SAVE_EVERY) >= self.SAVE_EVERY
+        if due:
+            self._save()
+
+    def refused(self, site, seen):
+        """Notes how old `seen` was when the site refused it, unless it was already replaced,
+        carried no clearance, or was noted already: the pages and images loading at that moment
+        are all refused while the renewal runs, and would otherwise fill every slot with one age."""
+        obtained = self.clearances.obtained_at.get(site)
+        if not seen or not seen[0] or obtained is None or self.clearances.get(site) is not seen:
+            return
+        age = self.clock() - obtained
+        if age <= 0:
+            return  # the clock was set back
+        with self.lock:
+            if self.noted.get(site) is seen:
+                return
+            self.noted[site] = seen
+            self.lifetimes[site] = (self.lifetimes.get(site, []) + [age])[-self.KEEP:]
+            renew_at = self.RENEW_AT * self.lifetime(site)
+        log(f"{site} refused a clearance {age / 60:.0f} min old, renewing it at {renew_at / 60:.0f} min from now on")
+        self._save()
+
+    def tick(self):
+        now = self.clock()
+        with self.lock:
+            hosts = [h for h, t in self.last_used.items() if now - t <= self.keep]
+        for site in hosts:
+            if now < self.next_try.get(site, 0) or not self.allows(site):
+                continue
+            try:
+                self._keep_warm(site, now)
+            except Exception as error:  # noqa: BLE001 - one host failing must not stop the others
+                # Not retried every minute: each try may open a browser.
+                self.next_try[site] = now + self.check
+                log(f"keeping {site} ready failed: {error}")
+
+    def _keep_warm(self, site, now):
+        current = self.clearances.get(site)
+        # No clearance yet (just restarted, or the warm-up failed): left to the warm-up and the
+        # reader's next page, so `WARM_UP=0` still means no browser at start-up.
+        if current is None:
+            return
+        obtained = self.clearances.obtained_at.get(site, now)
+        lifetime = self.lifetime(site)
+        if current[0] and lifetime and now - obtained >= self.RENEW_AT * lifetime and self.trial.get(site) is not current:
+            # Counted once the renewal is done, so failed tries do not bring the trial forward.
+            count = self.early.get(site, 0) + 1
+            if count % self.TRIAL_EVERY:
+                log(f"renewing the clearance for {site} before the site stops taking it")
+                self.clearances.renew(site, current, pause_on_failure=False)
+                self.early[site] = count
+                return
+            log(f"keeping the clearance for {site} past {lifetime / 60:.0f} min to see if it lasts longer now")
+            self.early[site] = count
+            self.trial[site] = current
+        # A clearance kept past the estimate is checked every tenth of it, so the age noted when
+        # it is refused is not off by up to a whole `check`.
+        every = self.check
+        if self.trial.get(site) is current and lifetime and now - obtained >= lifetime:
+            every = min(every, max(60, lifetime / 10))
+        if now - max(self.checked_at.get(site, 0), obtained) < every:
+            return
+        self.checked_at[site] = now
+        status, headers, _ = self.sender("GET", f"https://{site}/", with_clearance({}, current), None)
+        if is_challenge(status, headers):
+            log(f"{site} no longer takes its clearance, renewing it before the reader's next page")
+            self.refused(site, current)
+            self.clearances.renew(site, current, pause_on_failure=False)
+        else:
+            log(f"{site} still takes its clearance, {(now - obtained) / 60:.0f} min old")
+            if current[0]:
+                self.survived(site, now - obtained)
+
+    def survived(self, site, age):
+        """The site still took a clearance `age` old, so any shorter age noted before was not how
+        long it lasts (an early refusal, or the site now keeps them longer). With none left,
+        `age` itself stands in, so a clearance kept past the estimate is still checked every
+        tenth of it and the age noted at its refusal stays that close."""
+        with self.lock:
+            ages = self.lifetimes.get(site)
+            if not ages or age <= min(ages):
+                return
+            self.lifetimes[site] = [a for a in ages if a > age] or [age]
+        log(f"{site} still took a clearance {age / 60:.0f} min old, dropping the shorter ages noted before")
+        self._save()
+
+    def run(self):
+        while True:
+            time.sleep(60)
+            try:
+                self.tick()
+            except Exception as error:  # noqa: BLE001 - the loop must outlive any one failure
+                log(f"keeping hosts ready failed: {error}")
+
+
+def make_handler(token, rules, clearances, sender=send, upkeep=None):
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         server_version = "aidoku-cf-relay"
@@ -486,6 +675,8 @@ def make_handler(token, rules, clearances, sender=send):
                 status, site_headers, data = sender(self.command, url, with_clearance(headers, used), body)
                 if is_challenge(status, site_headers):
                     log(f"challenged on {url}, renewing the clearance")
+                    if upkeep:
+                        upkeep.refused(site, used)
                     clearances.renew(site, used)
                     status, site_headers, data = sender(
                         self.command, url, with_clearance(headers, clearances.get(site)), body
@@ -498,6 +689,8 @@ def make_handler(token, rules, clearances, sender=send):
                 # The detail is only logged: echoed back it would tell a token holder how a host
                 # failed (refused, certificate, timeout), a way to probe what answers behind a name.
                 return self.reply(502, {"Content-Type": "text/plain"}, b"relay error, see the relay's log")
+            if upkeep:
+                upkeep.used(site)
             # A list of pairs, so a header the site sends more than once (Vary, Link) keeps every value.
             out = [(k, v) for k, v in site_headers.items() if k.lower() not in DROPPED_RESPONSE_HEADERS]
             if site_headers.get("Location"):
@@ -533,6 +726,16 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
 
 
+def start_upkeep(seen_file, clearances, keep_days, check_minutes, allows):
+    """The background renewals, kept beside `seen_file`, or None when `keep_days` turns them off."""
+    if not keep_days > 0:
+        return None
+    upkeep = Upkeep(os.path.join(os.path.dirname(seen_file), "clearances.json"), clearances,
+                    keep_days, check_minutes, allows=allows)
+    threading.Thread(target=upkeep.run, daemon=True).start()
+    return upkeep
+
+
 def main():
     token = os.environ.get("RELAY_TOKEN", "").strip()
     if not token or token == PLACEHOLDER_TOKEN:
@@ -544,9 +747,18 @@ def main():
     rules = HostRules.parse(os.environ.get("ALLOWED_HOSTS", "*"))
     if not rules.patterns:
         sys.exit("ALLOWED_HOSTS is empty. Leave it out to allow every public host, or list patterns.")
-    seen = SeenHosts(os.environ.get("SEEN_HOSTS_FILE", "/data/hosts.txt"))
+    try:
+        keep_days = float(os.environ.get("KEEP_WARM_DAYS", "7"))
+        check_minutes = float(os.environ.get("CHECK_MINUTES", "30"))
+    except ValueError:
+        sys.exit("KEEP_WARM_DAYS and CHECK_MINUTES must be numbers.")
+    if not check_minutes >= 1:
+        sys.exit("CHECK_MINUTES must be at least 1.")
+    seen_file = os.environ.get("SEEN_HOSTS_FILE", "/data/hosts.txt")
+    seen = SeenHosts(seen_file)
     clearances = Clearances(trawl, on_new=seen.add)
-    handler = make_handler(token, rules, clearances)
+    upkeep = start_upkeep(seen_file, clearances, keep_days, check_minutes, rules.allows)
+    handler = make_handler(token, rules, clearances, upkeep=upkeep)
     log(f"listening on :{port}, TRAWL at {trawl}, hosts {rules}")
     if os.environ.get("WARM_UP", "1") != "0":
         hosts = list(reversed(seen.hosts)) + sorted(rules.exact())

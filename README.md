@@ -54,7 +54,7 @@ Do not open port 8191 on your router. The relay speaks plain http, so site passw
 
 ### Troubleshooting
 
-- **The first page of a site is slow**: the relay is passing the challenge for that host, about 15 seconds. Later pages are fast. It happens again when the site asks for a new check.
+- **The first page of a site is slow**: the relay is passing the challenge for that host, about 15 seconds. Later pages are fast. For sites used in the last 7 days, the relay learns how often the site asks for a new check and renews before that; see [Background checks and early renewal](#background-checks-and-early-renewal). Until it has learned, a page now and then is slow again while reading.
 - **The source shows an error**: check that `/health` shows `ok`, that the password matches `.env`, that the host is allowed by `ALLOWED_HOSTS` if you set it, and that the computer's firewall allows port 8191.
 - **Finding out why**: run `docker compose logs relay` in the folder. It shows each request and its result, and why the relay did not start.
 - **Whether a site passes** depends on Cloudflare and on how the computer's IP is rated. Speed depends on the connection between the relay and the site.
@@ -66,10 +66,12 @@ Do not open port 8191 on your router. The relay speaks plain http, so site passw
 |---|---|---|
 | `RELAY_TOKEN` | (required) | Password sent by sources in `X-Relay-Token` |
 | `ALLOWED_HOSTS` | `*` | Hosts the relay forwards to, comma separated. `*` matches any characters: `*.example.com` covers the subdomains (not `example.com` itself). Hosts on your local network (IP addresses, `localhost`, names without a dot, `.local`, `.lan`, `.home.arpa` and the like, names that do not resolve, and names that resolve to an address that is not public) are always refused |
-| `SEEN_HOSTS_FILE` | `/data/hosts.txt` | Where the relay remembers the sites it got a clearance for (up to 50, most recently solved first), to pass their challenge again after a restart. Compose keeps it in the `relay-data` volume |
+| `SEEN_HOSTS_FILE` | `/data/hosts.txt` | Where the relay remembers the sites it got a clearance for (up to 50, most recently solved first), to pass their challenge again after a restart. How long each site's clearance lasts and when it was last used go in `clearances.json` in the same folder. Compose keeps them in the `relay-data` volume |
 | `TRAWL_URL` | `http://trawl:8191` | Where TRAWL runs |
 | `PORT` | `8080` | Port inside the container |
 | `WARM_UP` | `1` | `0` skips getting clearances at start-up |
+| `KEEP_WARM_DAYS` | `7` | Sites ask for a new check every so often. For sites used in the last this many days, the relay gets a new clearance in the background before that, so reading never stops for about 15 seconds. Raise it and sites you come back to after longer do not wait either, at the cost of opening a browser for each site every so often. `0` turns it off. See [Background checks and early renewal](#background-checks-and-early-renewal) |
+| `CHECK_MINUTES` | `30` | Every this many minutes the site's home page is opened with the current clearance to see that it still works, and a new one is got if not. This is an ordinary request, no browser. Lower it and a clearance the site dropped is replaced sooner, with more requests to the site. At least `1` |
 
 `PORT` only matters when you run `relay.py` yourself. With compose, change the left side of `"8191:8080"` instead.
 
@@ -203,6 +205,33 @@ source ──> relay ──(clearance + its user agent)──> site
 - The log records each request's URL (including search terms), never cookies or passwords.
 - The relay itself never connects to a local network. TRAWL's browser opens the sites it is sent to, following their scripts and redirects, so keep the password private.
 - TRAWL is a separate project (AGPL-3.0) running in its own container. This relay only calls it over HTTP.
+
+### Background checks and early renewal
+
+How long a site accepts one clearance is set by its own Cloudflare settings, often 30 minutes. The clearance itself always says it lasts a year, which has nothing to do with how long the site accepts it, so the relay learns each site's time by watching, and renews before the site refuses, so a reader in the middle of a chapter does not wait about 15 seconds.
+
+1. **Check**: for sites used in the last `KEEP_WARM_DAYS` days, the home page is loaded with the current clearance every `CHECK_MINUTES` minutes. This is an ordinary request, no browser, about 1 second. A refused clearance is renewed right away.
+2. **Learn**: when a site refuses a clearance (found by a check or met by a reader's request), the relay notes how old it was. The shortest of the last 3 becomes the site's time, at least 10 minutes, so one early refusal does not open a browser every few minutes.
+3. **Renew early**: once the time is known, a clearance is renewed in the background at 80% of it. Readers' requests use the old one meanwhile.
+4. **Relearn**: a site may start accepting clearances for longer. One early renewal in 5 is skipped and that clearance is kept. Past the learned time it is checked every tenth of that time. A check that passes raises the time; a refusal notes the real one. That time the reader may meet one page that takes about 15 seconds.
+
+Also:
+
+- A site whose time is not known yet only gets step 1. If a reader meets a refusal between two checks, that page is slow once and the time is noted.
+- The learned times and when each site was last used are kept in `clearances.json`, in the same folder as `SEEN_HOSTS_FILE`, and survive a restart.
+- After a restart the background does not get clearances for sites; that is the start-up warm-up (`WARM_UP`) and the reader's first request. With `WARM_UP=0` no browser opens at start-up.
+- When a background renewal fails, that site is tried again after `CHECK_MINUTES` minutes. Readers' requests are not affected.
+- Sites not used for more than `KEEP_WARM_DAYS` days are no longer checked, and their first page is slow once the next time.
+
+These show in `docker compose logs relay`:
+
+| Line | Meaning |
+|---|---|
+| `still takes its clearance, N min old` | The check passed; the clearance is N minutes old |
+| `refused a clearance N min old, renewing it at M min from now on` | The site refused a clearance N minutes old; from now on it is renewed at M minutes |
+| `renewing the clearance for … before the site stops taking it` | Early renewal |
+| `keeping the clearance for … past N min to see if it lasts longer now` | Not renewed early this time, to see whether the site accepts it longer |
+| `still took a clearance N min old, dropping the shorter ages noted before` | The site accepts clearances longer than learned; the time goes up |
 
 ## License
 

@@ -9,6 +9,8 @@ services:
       ALLOWED_HOSTS: ${ALLOWED_HOSTS:-*}
       TRAWL_URL: http://trawl:8191
       WARM_UP: ${WARM_UP:-1}
+      KEEP_WARM_DAYS: ${KEEP_WARM_DAYS:-7}
+      CHECK_MINUTES: ${CHECK_MINUTES:-30}
     volumes:
       - relay-data:/data
     depends_on:

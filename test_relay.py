@@ -492,6 +492,8 @@ class RelayTest(unittest.TestCase):
             ({"ALLOWED_HOSTS": "example.com"}, "RELAY_TOKEN"),
             ({"RELAY_TOKEN": relay.PLACEHOLDER_TOKEN, "ALLOWED_HOSTS": "example.com"}, "RELAY_TOKEN"),
             ({"RELAY_TOKEN": "secret", "ALLOWED_HOSTS": " , "}, "ALLOWED_HOSTS"),
+            ({"RELAY_TOKEN": "secret", "CHECK_MINUTES": "0"}, "CHECK_MINUTES"),
+            ({"RELAY_TOKEN": "secret", "KEEP_WARM_DAYS": "a week"}, "KEEP_WARM_DAYS"),
         ]:
             result = subprocess.run(
                 [sys.executable, relay.__file__], env={**base, **extra, "PORT": "0"},
@@ -499,6 +501,258 @@ class RelayTest(unittest.TestCase):
             )
             self.assertNotEqual(result.returncode, 0)
             self.assertIn(message, result.stderr)
+
+
+class UpkeepTest(unittest.TestCase):
+    """Clearances and Upkeep on one fake clock, against the fake Site."""
+
+    def setUp(self):
+        import os
+        import tempfile
+
+        self.folder = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.folder.name, "clearances.json")
+        self.now = [1000.0]
+        self.site = Site()
+        self.solves = []
+        self.clearances = relay.Clearances("http://trawl", self.fetch, clock=self.clock)
+        self.upkeep = self.make()
+
+    def tearDown(self):
+        self.folder.cleanup()
+
+    def clock(self):
+        return self.now[0]
+
+    def fetch(self, site):
+        self.solves.append(site)
+        return self.site.valid, "Firefox/152"
+
+    def make(self, keep_days=7, check_minutes=30):
+        return relay.Upkeep(self.path, self.clearances, keep_days, check_minutes, sender=self.site, clock=self.clock)
+
+    def start(self, site="bakamh.com"):
+        """A clearance obtained now for a host the reader used now."""
+        self.clearances.renew(site, None)
+        self.upkeep.used(site)
+
+    def test_learns_the_lifetime_when_the_reader_is_refused(self):
+        handler = relay.make_handler("secret", rules("bakamh.com"), self.clearances, self.site, upkeep=self.upkeep)
+        server = relay.Server(("127.0.0.1", 0), handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            url = f"http://127.0.0.1:{server.server_address[1]}/r/bakamh.com/"
+            fetch = lambda: urllib.request.urlopen(urllib.request.Request(url, headers={"X-Relay-Token": "secret"}), timeout=5)
+            fetch()
+            self.assertEqual(self.upkeep.last_used, {"bakamh.com": 1000.0})
+            self.now[0] += 1800
+            self.site.valid = "key-2"
+            self.assertEqual(fetch().status, 200)
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertEqual(self.upkeep.lifetimes, {"bakamh.com": [1800.0]})
+        self.assertEqual(self.solves, ["bakamh.com", "bakamh.com"])
+
+    def test_keeps_the_shortest_of_the_last_ages_above_a_floor(self):
+        self.start()
+        for age in (3000, 2000, 2500, 2600):
+            self.clearances.renew("bakamh.com", self.clearances.get("bakamh.com"))
+            self.clearances.obtained_at["bakamh.com"] = self.now[0] - age
+            self.upkeep.refused("bakamh.com", self.clearances.get("bakamh.com"))
+        # 3000 dropped out, so the shortest of the last three is 2000.
+        self.assertEqual(self.upkeep.lifetime("bakamh.com"), 2000)
+        self.clearances.renew("bakamh.com", self.clearances.get("bakamh.com"))
+        self.clearances.obtained_at["bakamh.com"] = self.now[0] - 60
+        self.upkeep.refused("bakamh.com", self.clearances.get("bakamh.com"))
+        self.assertEqual(self.upkeep.lifetime("bakamh.com"), relay.Upkeep.MIN_LIFETIME)
+
+    def test_does_not_learn_from_a_replaced_or_missing_clearance(self):
+        self.start()
+        old = self.clearances.get("bakamh.com")
+        self.clearances.renew("bakamh.com", old)
+        self.upkeep.refused("bakamh.com", old)
+        self.upkeep.refused("bakamh.com", (None, "UA"))
+        self.assertEqual(self.upkeep.lifetimes, {})
+
+    def test_renews_before_the_learned_lifetime(self):
+        self.upkeep.lifetimes["bakamh.com"] = [1800]
+        self.start()
+        self.now[0] += 1439
+        self.upkeep.tick()
+        self.assertEqual(self.solves, ["bakamh.com"])
+        self.now[0] += 1
+        self.upkeep.tick()
+        self.assertEqual(self.solves, ["bakamh.com", "bakamh.com"])
+        # Renewed without loading a page first.
+        self.assertEqual(self.site.calls, [])
+
+    def test_checks_a_host_without_a_known_lifetime(self):
+        self.start()
+        self.now[0] += 1799
+        self.upkeep.tick()
+        self.assertEqual(self.site.calls, [])
+        self.now[0] += 1
+        self.upkeep.tick()
+        self.assertEqual(len(self.site.calls), 1)
+        method, url, sent, _ = self.site.calls[0]
+        self.assertEqual((method, url, sent["cookie"]), ("GET", "https://bakamh.com/", "cf_clearance=key-1"))
+        self.assertEqual(self.solves, ["bakamh.com"])
+        self.site.valid = "key-2"
+        self.now[0] += 1800
+        self.upkeep.tick()
+        self.assertEqual(self.solves, ["bakamh.com", "bakamh.com"])
+        self.assertEqual(self.upkeep.lifetimes, {"bakamh.com": [3600.0]})
+
+    def test_leaves_hosts_alone_after_the_window(self):
+        self.upkeep.lifetimes["bakamh.com"] = [1800]
+        self.start()
+        self.now[0] += 7 * 86400 + 1
+        self.upkeep.tick()
+        self.assertEqual((self.solves, self.site.calls), (["bakamh.com"], []))
+
+    def test_backs_off_a_host_that_fails_and_goes_on(self):
+        for site in ("bakamh.com", "18mh.org"):
+            self.upkeep.lifetimes[site] = [1800]
+            self.start(site)
+        self.solves.clear()
+
+        def broken(site):
+            self.solves.append(site)
+            raise RuntimeError("TRAWL down")
+
+        self.clearances.fetch_clearance = broken
+        self.now[0] += 1440
+        self.upkeep.tick()
+        self.assertEqual(sorted(self.solves), ["18mh.org", "bakamh.com"])
+        self.now[0] += 60
+        self.upkeep.tick()
+        self.assertEqual(len(self.solves), 2)
+        # The reader is not paused by a failure in the background.
+        self.assertEqual(self.clearances.failed_at, {})
+
+    def test_lets_every_fifth_clearance_run_to_learn_a_longer_lifetime(self):
+        self.upkeep.lifetimes["bakamh.com"] = [1000]
+        self.start()
+        for _ in range(relay.Upkeep.TRIAL_EVERY - 1):
+            self.now[0] += 800
+            self.upkeep.tick()
+        self.assertEqual(len(self.solves), relay.Upkeep.TRIAL_EVERY)
+        self.now[0] += 800
+        self.upkeep.tick()
+        self.now[0] += 1000
+        self.upkeep.tick()
+        # Not renewed early; the check at 1800 s passed, so that is the estimate now.
+        self.assertEqual(len(self.solves), relay.Upkeep.TRIAL_EVERY)
+        self.assertEqual(len(self.site.calls), 1)
+        self.assertEqual(self.upkeep.lifetimes, {"bakamh.com": [1800.0]})
+
+    def test_keeps_checking_often_after_a_kept_clearance_passes(self):
+        self.upkeep.lifetimes["bakamh.com"] = [1000]
+        self.start()
+        self.upkeep.early["bakamh.com"] = relay.Upkeep.TRIAL_EVERY - 1
+        self.now[0] += 1000
+        self.upkeep.tick()
+        self.assertEqual(len(self.site.calls), 1)
+        self.now[0] += 500
+        self.upkeep.tick()
+        self.assertEqual(self.upkeep.lifetimes, {"bakamh.com": [1500.0]})
+        # Still checked every tenth of the estimate, not every 30 min.
+        self.now[0] += 150
+        self.upkeep.tick()
+        self.assertEqual(len(self.site.calls), 3)
+        self.site.valid = "key-2"
+        self.now[0] += 165
+        self.upkeep.tick()
+        self.assertEqual(self.upkeep.lifetimes, {"bakamh.com": [1650.0, 1815.0]})
+
+    def test_a_failed_renewal_does_not_count_toward_the_trial(self):
+        self.upkeep.lifetimes["bakamh.com"] = [1000]
+        self.start()
+        self.clearances.fetch_clearance = lambda site: (_ for _ in ()).throw(RuntimeError("TRAWL down"))
+        self.now[0] += 800
+        self.upkeep.tick()
+        self.assertEqual(self.upkeep.early, {})
+
+    def test_notes_one_refused_clearance_once(self):
+        self.start()
+        self.upkeep.lifetimes["bakamh.com"] = [900, 1200]
+        self.now[0] += 1800
+        seen = self.clearances.get("bakamh.com")
+        threads = [threading.Thread(target=self.upkeep.refused, args=("bakamh.com", seen)) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(self.upkeep.lifetimes, {"bakamh.com": [900, 1200, 1800.0]})
+
+    def test_skips_hosts_no_longer_allowed(self):
+        self.upkeep.allows = lambda host: False
+        self.start()
+        self.now[0] += 3600
+        self.upkeep.tick()
+        self.assertEqual(self.site.calls, [])
+
+    def test_checks_a_kept_clearance_more_often_past_the_estimate(self):
+        self.upkeep.lifetimes["bakamh.com"] = [1000]
+        self.start()
+        self.upkeep.early["bakamh.com"] = relay.Upkeep.TRIAL_EVERY - 1
+        self.now[0] += 800
+        self.upkeep.tick()
+        self.assertEqual(len(self.solves), 1)
+        self.now[0] += 200
+        self.upkeep.tick()
+        # Past the estimate: checked every 100 s, not every 30 min.
+        self.assertEqual(len(self.site.calls), 1)
+        self.now[0] += 99
+        self.upkeep.tick()
+        self.assertEqual(len(self.site.calls), 1)
+        self.now[0] += 1
+        self.upkeep.tick()
+        self.assertEqual(len(self.site.calls), 2)
+
+    def test_a_passed_check_drops_only_shorter_ages(self):
+        self.start()
+        self.upkeep.lifetimes["bakamh.com"] = [700, 2400, 3000]
+        self.upkeep.survived("bakamh.com", 1800)
+        self.assertEqual(self.upkeep.lifetimes, {"bakamh.com": [2400, 3000]})
+
+    def test_leaves_a_host_without_a_clearance_to_the_warm_up(self):
+        # Just restarted: used last week, no clearance in memory yet.
+        self.upkeep.used("bakamh.com")
+        self.upkeep.lifetimes["bakamh.com"] = [1800]
+        self.now[0] += 3600
+        self.upkeep.tick()
+        self.assertEqual((self.solves, self.site.calls), ([], []))
+
+    def test_ignores_an_age_from_a_clock_set_back(self):
+        self.start()
+        self.now[0] -= 100
+        self.upkeep.refused("bakamh.com", self.clearances.get("bakamh.com"))
+        self.assertEqual(self.upkeep.lifetimes, {})
+
+    def test_keep_warm_days_zero_turns_it_off(self):
+        import os
+
+        seen_file = os.path.join(self.folder.name, "hosts.txt")
+        self.assertIsNone(relay.start_upkeep(seen_file, self.clearances, 0, 30, lambda host: True))
+        upkeep = relay.start_upkeep(seen_file, self.clearances, 7, 30, lambda host: True)
+        self.assertEqual(upkeep.path, self.path)
+
+    def test_remembers_lifetimes_and_use_across_a_restart(self):
+        self.start()
+        self.clearances.obtained_at["bakamh.com"] = self.now[0] - 1800
+        self.upkeep.refused("bakamh.com", self.clearances.get("bakamh.com"))
+        again = self.make()
+        self.assertEqual(again.lifetimes, {"bakamh.com": [1800.0]})
+        self.assertEqual(again.last_used, {"bakamh.com": 1000.0})
+
+    def test_starts_from_nothing_with_a_broken_file(self):
+        for content in ("not json", "[1, 2]", '{"lifetimes": {"a@b": [1], "ok.com": ["x", -1]}, "last_used": {"ok.com": "x"}}'):
+            with open(self.path, "w", encoding="utf-8") as file:
+                file.write(content)
+            upkeep = self.make()
+            self.assertEqual((upkeep.lifetimes, upkeep.last_used), ({}, {}), content)
 
 
 if __name__ == "__main__":
