@@ -213,7 +213,7 @@ let html = Html::parse_with_url(&response.get_string()?, url)?;
 1. **檢查**：最近 `KEEP_WARM_DAYS` 天用過的網站，每 `CHECK_MINUTES` 分鐘用現有的驗證結果載入一次首頁。這只是一般的請求，不開瀏覽器，約 1 秒。被拒就馬上換新的。
 2. **學習**：網站拒絕一份驗證結果時（不論是檢查發現的，還是讀者的請求遇到的），轉發伺服器記下那份用了多久。取最近 3 次裡最短的當作這個網站的時間，最少 10 分鐘，一次提早作廢不會讓它變成每幾分鐘開一次瀏覽器。
 3. **提前換新**：知道時間之後，驗證結果用到這個時間的 80% 就在背景換新的。換新期間讀者的請求照用舊的那份。
-4. **重新學習**：網站可能改成接受得更久。每 5 次提前換新有 1 次不換，讓那份驗證結果繼續用。超過學到的時間之後，改成每過這個時間的十分之一檢查一次。檢查通過就把時間往上調，被拒就記下實際的時間。這一次讀者可能會遇到一頁慢約 15 秒。
+4. **重新學習**：網站可能改成接受得更久。每 5 次提前換新有 1 次會把舊的驗證結果留著，讀者照樣用新的。舊的那份每過學到的時間的十分之一檢查一次，直到網站拒絕，最多檢查一天。超過學到的時間還通過就把時間往上調，被拒就記下實際的時間。
 
 其他行為：
 
@@ -230,7 +230,9 @@ let html = Html::parse_with_url(&response.get_string()?, url)?;
 | `still takes its clearance, N min old` | 檢查通過，驗證結果用了 N 分鐘 |
 | `refused a clearance N min old, renewing it at M min from now on` | 網站拒絕了用了 N 分鐘的驗證結果，之後用到 M 分鐘就換 |
 | `renewing the clearance for … before the site stops taking it` | 提前換新 |
-| `keeping the clearance for … past N min to see if it lasts longer now` | 這次不提前換，看網站是不是接受得更久 |
+| `keeping the old clearance for … to see if it lasts past N min now` | 這次提前換新後舊的留著，看網站是不是接受得更久 |
+| `refused the clearance kept aside at N min, renewing at M min from now on` | 網站在 N 分鐘拒絕了留著的那份，之後用到 M 分鐘就換 |
+| `stopped checking the clearance kept aside for …, it lasted past 24 h` | 留著的那份過了一天網站還接受，不再檢查 |
 | `still took a clearance N min old, dropping the shorter ages noted before` | 網站接受得比學到的久，時間往上調 |
 
 ## 授權

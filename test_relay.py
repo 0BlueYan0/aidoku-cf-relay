@@ -43,6 +43,28 @@ class Site:
         return 200, headers(content_type="text/html"), b"<html>page</html>"
 
 
+class AgingSite:
+    """A fake site that takes each clearance it gave out until it is `life` seconds old."""
+
+    def __init__(self, clock, life):
+        self.clock = clock
+        self.life = life
+        self.issued = {}
+        self.calls = []
+
+    def issue(self):
+        key = f"key-{len(self.issued) + 1}"
+        self.issued[key] = self.clock()
+        return key, "Firefox/152"
+
+    def __call__(self, method, url, sent, body):
+        self.calls.append((method, url, dict(sent), body))
+        key = sent.get("cookie", "").partition("cf_clearance=")[2].split(";")[0]
+        if key not in self.issued or self.clock() - self.issued[key] >= self.life:
+            return 403, headers(cf_mitigated="challenge", content_type="text/html"), b"challenge"
+        return 200, headers(content_type="text/html"), b"<html>page</html>"
+
+
 class RelayTest(unittest.TestCase):
     def setUp(self):
         self.site = Site()
@@ -631,40 +653,142 @@ class UpkeepTest(unittest.TestCase):
         # The reader is not paused by a failure in the background.
         self.assertEqual(self.clearances.failed_at, {})
 
-    def test_lets_every_fifth_clearance_run_to_learn_a_longer_lifetime(self):
-        self.upkeep.lifetimes["bakamh.com"] = [1000]
+    def aging(self, life):
+        """Swaps the fake Site for an AgingSite whose clearances last `life` seconds."""
+        site = AgingSite(self.clock, life)
+
+        def fetch(host):
+            self.solves.append(host)
+            return site.issue()
+
+        self.clearances.fetch_clearance = fetch
+        self.upkeep.sender = site
+        return site
+
+    def start_trial(self, lifetime=1000):
+        """A host whose next early renewal, 800 s after its clearance, is a trial."""
+        self.upkeep.lifetimes["bakamh.com"] = [lifetime]
         self.start()
-        for _ in range(relay.Upkeep.TRIAL_EVERY - 1):
-            self.now[0] += 800
-            self.upkeep.tick()
-        self.assertEqual(len(self.solves), relay.Upkeep.TRIAL_EVERY)
+        self.upkeep.early["bakamh.com"] = relay.Upkeep.TRIAL_EVERY - 1
+        old = self.clearances.get("bakamh.com")
         self.now[0] += 800
         self.upkeep.tick()
-        self.now[0] += 1000
-        self.upkeep.tick()
-        # Not renewed early; the check at 1800 s passed, so that is the estimate now.
-        self.assertEqual(len(self.solves), relay.Upkeep.TRIAL_EVERY)
-        self.assertEqual(len(self.site.calls), 1)
-        self.assertEqual(self.upkeep.lifetimes, {"bakamh.com": [1800.0]})
+        return old
 
-    def test_keeps_checking_often_after_a_kept_clearance_passes(self):
+    def test_renews_every_fifth_clearance_too_and_keeps_the_old_one(self):
+        self.aging(1000)
+        self.upkeep.lifetimes["bakamh.com"] = [1000]
+        self.start()
+        for _ in range(relay.Upkeep.TRIAL_EVERY):
+            old = self.clearances.get("bakamh.com")
+            self.now[0] += 800
+            self.upkeep.tick()
+            self.assertIsNot(self.clearances.get("bakamh.com"), old)
+        self.assertEqual(len(self.solves), relay.Upkeep.TRIAL_EVERY + 1)
+        self.assertEqual(self.upkeep.trials["bakamh.com"]["clearance"], old)
+
+    def test_the_reader_is_not_refused_while_the_old_one_is_tried(self):
+        site = self.aging(1000)
+        old = self.start_trial()
+        self.now[0] += 250
+        # The kept clearance is 1050 s old and refused; the reader's is 250 s old.
+        handler = relay.make_handler("secret", rules("bakamh.com"), self.clearances, site, upkeep=self.upkeep)
+        server = relay.Server(("127.0.0.1", 0), handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            url = f"http://127.0.0.1:{server.server_address[1]}/r/bakamh.com/c-1/"
+            request = urllib.request.Request(url, headers={"X-Relay-Token": "secret"})
+            self.assertEqual(urllib.request.urlopen(request, timeout=5).status, 200)
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertEqual(self.upkeep.noted, {})
+        self.upkeep.tick()
+        self.assertEqual(self.upkeep.lifetimes, {"bakamh.com": [1000, 1050.0]})
+        self.assertEqual(self.upkeep.trials, {})
+        self.assertEqual(len(self.solves), 2)
+        # Not checked again once refused.
+        before = len(site.calls)
+        self.now[0] += 200
+        self.upkeep.tick()
+        self.assertNotIn(f"cf_clearance={old[0]}", [sent.get("cookie") for _, _, sent, _ in site.calls[before:]])
+
+    def test_a_kept_clearance_that_passes_lengthens_the_estimate(self):
+        site = self.aging(5000)
+        old = self.start_trial()
+        for _ in range(3):
+            self.now[0] += 100
+            self.upkeep.tick()
+        # Checked every tenth of the estimate, at 900, 1000 and 1100 s, not every 30 min.
+        self.assertEqual([sent["cookie"] for _, _, sent, _ in site.calls], [f"cf_clearance={old[0]}"] * 3)
+        self.assertEqual(self.upkeep.lifetimes, {"bakamh.com": [1100.0]})
+        # A tenth of the new estimate is 110 s: not sooner.
+        self.now[0] += 109
+        self.upkeep.tick()
+        self.assertEqual(len(site.calls), 3)
+        self.now[0] += 1
+        self.upkeep.tick()
+        self.assertEqual(len(site.calls), 4)
+
+    def test_stops_checking_a_kept_clearance_after_a_day(self):
+        site = self.aging(10 * 86400)
+        old = self.start_trial()
+        self.now[0] = self.clearances.obtained_at["bakamh.com"] - 800 + relay.Upkeep.TRIAL_LIMIT + 1
+        before = len(site.calls)
+        self.upkeep.tick()
+        self.assertEqual(self.upkeep.trials, {})
+        self.assertNotIn(f"cf_clearance={old[0]}", [sent.get("cookie") for _, _, sent, _ in site.calls[before:]])
+
+    def test_a_failed_trial_renewal_keeps_nothing_aside(self):
         self.upkeep.lifetimes["bakamh.com"] = [1000]
         self.start()
         self.upkeep.early["bakamh.com"] = relay.Upkeep.TRIAL_EVERY - 1
-        self.now[0] += 1000
+        self.clearances.fetch_clearance = lambda site: (_ for _ in ()).throw(RuntimeError("TRAWL down"))
+        self.now[0] += 800
         self.upkeep.tick()
-        self.assertEqual(len(self.site.calls), 1)
-        self.now[0] += 500
+        self.assertEqual((self.upkeep.trials, self.upkeep.early), ({}, {"bakamh.com": relay.Upkeep.TRIAL_EVERY - 1}))
+
+    def test_a_failed_check_of_the_kept_clearance_does_not_hold_back_renewals(self):
+        self.aging(1000)
+        self.start_trial()
+
+        def down(*args):
+            raise OSError("site down")
+
+        self.upkeep.sender = down
+        self.now[0] += 100
         self.upkeep.tick()
-        self.assertEqual(self.upkeep.lifetimes, {"bakamh.com": [1500.0]})
-        # Still checked every tenth of the estimate, not every 30 min.
-        self.now[0] += 150
+        self.assertEqual(self.upkeep.next_try, {})
+        # The new clearance, 800 s old, is still renewed on time.
+        self.now[0] += 700
         self.upkeep.tick()
-        self.assertEqual(len(self.site.calls), 3)
-        self.site.valid = "key-2"
-        self.now[0] += 165
+        self.assertEqual(len(self.solves), 3)
+
+    def test_a_failed_renewal_does_not_stop_checking_the_kept_clearance(self):
+        site = self.aging(1000)
+        old = self.start_trial()
+        self.clearances.fetch_clearance = lambda host: (_ for _ in ()).throw(RuntimeError("TRAWL down"))
+        self.upkeep.next_try["bakamh.com"] = self.now[0] + 1800
+        self.now[0] += 100
         self.upkeep.tick()
-        self.assertEqual(self.upkeep.lifetimes, {"bakamh.com": [1650.0, 1815.0]})
+        self.assertEqual(site.calls[-1][2]["cookie"], f"cf_clearance={old[0]}")
+
+    def test_drops_the_trial_of_a_host_no_longer_used(self):
+        self.aging(1000)
+        self.start_trial()
+        self.now[0] += 7 * 86400
+        self.upkeep.tick()
+        self.assertEqual(self.upkeep.trials, {})
+
+    def test_does_not_keep_aside_a_clearance_the_reader_was_refused_with(self):
+        self.aging(1000)
+        self.upkeep.lifetimes["bakamh.com"] = [1000]
+        self.start()
+        self.upkeep.early["bakamh.com"] = relay.Upkeep.TRIAL_EVERY - 1
+        self.upkeep.noted["bakamh.com"] = self.clearances.get("bakamh.com")
+        self.now[0] += 800
+        self.upkeep.tick()
+        self.assertEqual(self.upkeep.trials, {})
 
     def test_a_failed_renewal_does_not_count_toward_the_trial(self):
         self.upkeep.lifetimes["bakamh.com"] = [1000]
@@ -692,24 +816,6 @@ class UpkeepTest(unittest.TestCase):
         self.now[0] += 3600
         self.upkeep.tick()
         self.assertEqual(self.site.calls, [])
-
-    def test_checks_a_kept_clearance_more_often_past_the_estimate(self):
-        self.upkeep.lifetimes["bakamh.com"] = [1000]
-        self.start()
-        self.upkeep.early["bakamh.com"] = relay.Upkeep.TRIAL_EVERY - 1
-        self.now[0] += 800
-        self.upkeep.tick()
-        self.assertEqual(len(self.solves), 1)
-        self.now[0] += 200
-        self.upkeep.tick()
-        # Past the estimate: checked every 100 s, not every 30 min.
-        self.assertEqual(len(self.site.calls), 1)
-        self.now[0] += 99
-        self.upkeep.tick()
-        self.assertEqual(len(self.site.calls), 1)
-        self.now[0] += 1
-        self.upkeep.tick()
-        self.assertEqual(len(self.site.calls), 2)
 
     def test_a_passed_check_drops_only_shorter_ages(self):
         self.start()

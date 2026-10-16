@@ -451,14 +451,18 @@ class Upkeep:
     lifetime is not known yet. An age found that way can be up to `check_minutes` too long; if
     the reader is then refused before the renewal, that shorter age wins.
 
-    Renewing early means the site never refuses again, so the estimate could only shrink. Every
-    `TRIAL_EVERY`th early renewal is skipped instead and that clearance is left to the checks:
-    a check that passes at an age past the estimate drops the shorter ages, and a refusal notes
-    the real one. The reader may meet that refusal, one page in `TRIAL_EVERY` lifetimes.
+    Renewing early means the site never refuses again, so the estimate could only shrink. At
+    every `TRIAL_EVERY`th early renewal the old clearance is therefore kept aside: the reader
+    gets the new one as usual, and the old one is checked every tenth of the estimate until the
+    site refuses it, which notes its real age, or it is `TRIAL_LIMIT` old. A check it passes past
+    the estimate drops the shorter ages. A new clearance does not stop the old one working
+    (baka2.cfd, 2026-10-16). Before that the clearance the reader used was the one left to run,
+    and on 2026-10-16 the reader met its refusal and waited 17.5 s for a page.
     """
 
     KEEP = 3
     TRIAL_EVERY = 5
+    TRIAL_LIMIT = 86400
     MIN_LIFETIME = 600
     RENEW_AT = 0.8
     # The time a host was last used goes to the file at most this often, not on every page.
@@ -479,7 +483,7 @@ class Upkeep:
         self.checked_at = {}
         self.next_try = {}
         self.early = {}
-        self.trial = {}
+        self.trials = {}
         self.noted = {}
         self._load()
 
@@ -542,24 +546,41 @@ class Upkeep:
             if self.noted.get(site) is seen:
                 return
             self.noted[site] = seen
-            self.lifetimes[site] = (self.lifetimes.get(site, []) + [age])[-self.KEEP:]
-            renew_at = self.RENEW_AT * self.lifetime(site)
+            renew_at = self._note(site, age)
         log(f"{site} refused a clearance {age / 60:.0f} min old, renewing it at {renew_at / 60:.0f} min from now on")
         self._save()
+
+    def _note(self, site, age):
+        """Adds a refusal at `age` and gives the age renewals happen at from now on. Called
+        holding `self.lock`."""
+        self.lifetimes[site] = (self.lifetimes.get(site, []) + [age])[-self.KEEP:]
+        return self.RENEW_AT * self.lifetime(site)
 
     def tick(self):
         now = self.clock()
         with self.lock:
             hosts = [h for h, t in self.last_used.items() if now - t <= self.keep]
+        # Here rather than in `_save`, which a reader's request also runs: `trials` is only
+        # touched by this thread. A host no longer visited would otherwise keep its trial.
+        for site in [h for h in self.trials if h not in hosts]:
+            del self.trials[site]
         for site in hosts:
-            if now < self.next_try.get(site, 0) or not self.allows(site):
+            if not self.allows(site):
                 continue
+            if now >= self.next_try.get(site, 0):
+                try:
+                    self._keep_warm(site, now)
+                except Exception as error:  # noqa: BLE001 - one host failing must not stop the others
+                    # Not retried every minute: each try may open a browser.
+                    self.next_try[site] = now + self.check
+                    log(f"keeping {site} ready failed: {error}")
+            # Apart from the renewals: a check that fails does not hold the next renewal back, and
+            # a renewal that fails does not stop the checks, or the age noted could be off by a
+            # whole `check`.
             try:
-                self._keep_warm(site, now)
-            except Exception as error:  # noqa: BLE001 - one host failing must not stop the others
-                # Not retried every minute: each try may open a browser.
-                self.next_try[site] = now + self.check
-                log(f"keeping {site} ready failed: {error}")
+                self._check_trial(site, now)
+            except Exception as error:  # noqa: BLE001 - the check must not stop the renewals
+                log(f"checking the clearance kept aside for {site} failed: {error}")
 
     def _keep_warm(self, site, now):
         current = self.clearances.get(site)
@@ -569,23 +590,18 @@ class Upkeep:
             return
         obtained = self.clearances.obtained_at.get(site, now)
         lifetime = self.lifetime(site)
-        if current[0] and lifetime and now - obtained >= self.RENEW_AT * lifetime and self.trial.get(site) is not current:
+        if current[0] and lifetime and now - obtained >= self.RENEW_AT * lifetime:
             # Counted once the renewal is done, so failed tries do not bring the trial forward.
             count = self.early.get(site, 0) + 1
-            if count % self.TRIAL_EVERY:
-                log(f"renewing the clearance for {site} before the site stops taking it")
-                self.clearances.renew(site, current, pause_on_failure=False)
-                self.early[site] = count
-                return
-            log(f"keeping the clearance for {site} past {lifetime / 60:.0f} min to see if it lasts longer now")
+            log(f"renewing the clearance for {site} before the site stops taking it")
+            self.clearances.renew(site, current, pause_on_failure=False)
             self.early[site] = count
-            self.trial[site] = current
-        # A clearance kept past the estimate is checked every tenth of it, so the age noted when
-        # it is refused is not off by up to a whole `check`.
-        every = self.check
-        if self.trial.get(site) is current and lifetime and now - obtained >= lifetime:
-            every = min(every, max(60, lifetime / 10))
-        if now - max(self.checked_at.get(site, 0), obtained) < every:
+            # A reader refused with `current` may have renewed it first; its age is noted already.
+            if not count % self.TRIAL_EVERY and site not in self.trials and self.noted.get(site) is not current:
+                self.trials[site] = {"clearance": current, "obtained": obtained, "checked": now}
+                log(f"keeping the old clearance for {site} to see if it lasts past {lifetime / 60:.0f} min now")
+            return
+        if now - max(self.checked_at.get(site, 0), obtained) < self.check:
             return
         self.checked_at[site] = now
         status, headers, _ = self.sender("GET", f"https://{site}/", with_clearance({}, current), None)
@@ -597,6 +613,32 @@ class Upkeep:
             log(f"{site} still takes its clearance, {(now - obtained) / 60:.0f} min old")
             if current[0]:
                 self.survived(site, now - obtained)
+
+    def _check_trial(self, site, now):
+        """Loads the home page with the clearance kept aside at a trial, every tenth of the
+        estimate, so the age noted when the site refuses it is off by that much at most."""
+        trial = self.trials.get(site)
+        if trial is None:
+            return
+        age = now - trial["obtained"]
+        if age > self.TRIAL_LIMIT:
+            # A site that never refuses would otherwise be loaded every few minutes for as long
+            # as the cookie says it lasts (a year).
+            del self.trials[site]
+            log(f"stopped checking the clearance kept aside for {site}, it lasted past {self.TRIAL_LIMIT / 3600:.0f} h")
+            return
+        if now - trial["checked"] < max(60, (self.lifetime(site) or self.MIN_LIFETIME) / 10):
+            return
+        trial["checked"] = now
+        status, headers, _ = self.sender("GET", f"https://{site}/", with_clearance({}, trial["clearance"]), None)
+        if not is_challenge(status, headers):
+            self.survived(site, age)
+            return
+        del self.trials[site]
+        with self.lock:
+            renew_at = self._note(site, age)
+        log(f"{site} refused the clearance kept aside at {age / 60:.0f} min, renewing at {renew_at / 60:.0f} min from now on")
+        self._save()
 
     def survived(self, site, age):
         """The site still took a clearance `age` old, so any shorter age noted before was not how

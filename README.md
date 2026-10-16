@@ -213,7 +213,7 @@ How long a site accepts one clearance is set by its own Cloudflare settings, oft
 1. **Check**: for sites used in the last `KEEP_WARM_DAYS` days, the home page is loaded with the current clearance every `CHECK_MINUTES` minutes. This is an ordinary request, no browser, about 1 second. A refused clearance is renewed right away.
 2. **Learn**: when a site refuses a clearance (found by a check or met by a reader's request), the relay notes how old it was. The shortest of the last 3 becomes the site's time, at least 10 minutes, so one early refusal does not open a browser every few minutes.
 3. **Renew early**: once the time is known, a clearance is renewed in the background at 80% of it. Readers' requests use the old one meanwhile.
-4. **Relearn**: a site may start accepting clearances for longer. One early renewal in 5 is skipped and that clearance is kept. Past the learned time it is checked every tenth of that time. A check that passes raises the time; a refusal notes the real one. That time the reader may meet one page that takes about 15 seconds.
+4. **Relearn**: a site may start accepting clearances for longer. At one early renewal in 5 the old clearance is kept aside while readers get the new one. The old one is checked every tenth of the learned time until the site refuses it, or for a day at most. A check that passes past the learned time raises it; a refusal notes the real one.
 
 Also:
 
@@ -230,7 +230,9 @@ These show in `docker compose logs relay`:
 | `still takes its clearance, N min old` | The check passed; the clearance is N minutes old |
 | `refused a clearance N min old, renewing it at M min from now on` | The site refused a clearance N minutes old; from now on it is renewed at M minutes |
 | `renewing the clearance for … before the site stops taking it` | Early renewal |
-| `keeping the clearance for … past N min to see if it lasts longer now` | Not renewed early this time, to see whether the site accepts it longer |
+| `keeping the old clearance for … to see if it lasts past N min now` | After this early renewal the old clearance is kept, to see whether the site accepts it longer |
+| `refused the clearance kept aside at N min, renewing at M min from now on` | The site refused the kept clearance at N minutes; from now on it is renewed at M minutes |
+| `stopped checking the clearance kept aside for …, it lasted past 24 h` | The site still accepted the kept clearance after a day; it is no longer checked |
 | `still took a clearance N min old, dropping the shorter ages noted before` | The site accepts clearances longer than learned; the time goes up |
 
 ## License
