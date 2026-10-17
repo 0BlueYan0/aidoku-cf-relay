@@ -190,7 +190,7 @@ let html = Html::parse_with_url(&response.get_string()?, url)?;
 
 轉發伺服器預設轉送所有公開網域，讀者不必列清單。仍請在說明裡列出圖源會經轉發送出的網域（包含鏡像），給想限制 `ALLOWED_HOSTS` 的讀者參考。只有在驗證後面的網域才有好處。沒有驗證的網域也能經轉發（只帶 TRAWL 的 `User-Agent`，不帶驗證結果），但直連比較快。
 
-完整範例：[aidoku-new-zh-sources](https://github.com/0BlueYan0/aidoku-new-zh-sources) 的 `zh.bakamh` 與 `zh.18mh`，檔案是 `sources/zh.bakamh/src/helper.rs` 與 `sources/zh.18mh/src/helper.rs`。
+完整範例：[aidoku-new-zh-sources](https://github.com/0BlueYan0/aidoku-new-zh-sources) 的 `zh.bakamh2` 與 `zh.18mh`，檔案是 `sources/zh.bakamh2/src/helper.rs` 與 `sources/zh.18mh/src/helper.rs`。
 
 ## 運作方式
 

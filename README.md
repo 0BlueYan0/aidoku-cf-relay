@@ -190,7 +190,7 @@ The app fetches covers and page images itself. If they are behind the challenge 
 
 By default the relay forwards to any public host, so readers do not need a list. List the hosts your source requests through the relay, mirrors included, for readers who restrict `ALLOWED_HOSTS`. Only hosts behind the challenge gain anything. A host without it also works (requests go with TRAWL's user agent and no clearance), but it is faster to leave it direct.
 
-A complete example: `zh.bakamh` and `zh.18mh` in [aidoku-new-zh-sources](https://github.com/0BlueYan0/aidoku-new-zh-sources), files `sources/zh.bakamh/src/helper.rs` and `sources/zh.18mh/src/helper.rs`.
+A complete example: `zh.bakamh2` and `zh.18mh` in [aidoku-new-zh-sources](https://github.com/0BlueYan0/aidoku-new-zh-sources), files `sources/zh.bakamh2/src/helper.rs` and `sources/zh.18mh/src/helper.rs`.
 
 ## How it works
 
